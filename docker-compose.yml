@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  quiz-solver:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      EMAIL: ${EMAIL}
+      SECRET: ${SECRET}
+      SYSTEM_PROMPT: ${SYSTEM_PROMPT}
+      USER_PROMPT: ${USER_PROMPT}
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+    volumes:
+      - ./.env:/app/.env
+    restart: unless-stopped
+
