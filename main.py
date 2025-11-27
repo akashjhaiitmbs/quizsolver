@@ -184,7 +184,7 @@ async def get_llm_response(prompt: str, system_instruction: Optional[str] = None
     """
     Get response from Google Gemini API with retry logic.
     """
-    model = genai.GenerativeModel("gemini-2.0-flash-exp")
+    model = genai.GenerativeModel("gemini-2.5-flash")
     
     try:
         if system_instruction:
