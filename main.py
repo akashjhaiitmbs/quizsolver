@@ -14,7 +14,13 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 import pandas as pd
+import io
+import csv
+import httpx
+import pandas as pd
+import pdfplumber
 from tenacity import retry, stop_after_attempt, wait_exponential
+from urllib.parse import urljoin
 
 # Load environment variables
 load_dotenv()
@@ -135,6 +141,41 @@ async def extract_question_from_html(html_content: str) -> str:
     return soup.get_text(strip=True)
 
 
+async def download_file(url: str) -> bytes:
+    """Download a file from a URL"""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url, follow_redirects=True)
+        response.raise_for_status()
+        return response.content
+
+
+def process_file(content: bytes, filename: str) -> str:
+    """Process file content based on extension and return text representation"""
+    filename = filename.lower()
+    
+    if filename.endswith(".pdf"):
+        try:
+            with pdfplumber.open(io.BytesIO(content)) as pdf:
+                text = ""
+                for page in pdf.pages:
+                    text += page.extract_text() or ""
+                return f"--- PDF CONTENT ({filename}) ---\n{text}\n--- END PDF CONTENT ---"
+        except Exception as e:
+            return f"Error reading PDF: {str(e)}"
+            
+    elif filename.endswith(".csv"):
+        try:
+            df = pd.read_csv(io.BytesIO(content))
+            return f"--- CSV CONTENT ({filename}) ---\n{df.to_markdown()}\n--- END CSV CONTENT ---"
+        except Exception as e:
+            return f"Error reading CSV: {str(e)}"
+            
+    elif filename.endswith(".txt") or filename.endswith(".json"):
+        return f"--- FILE CONTENT ({filename}) ---\n{content.decode('utf-8')}\n--- END FILE CONTENT ---"
+        
+    return f"Unsupported file type: {filename}"
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=2, max=10)
@@ -143,7 +184,7 @@ async def get_llm_response(prompt: str, system_instruction: Optional[str] = None
     """
     Get response from Google Gemini API with retry logic.
     """
-    model = genai.GenerativeModel("gemini-pro")
+    model = genai.GenerativeModel("gemini-2.0-flash-exp")
     
     try:
         if system_instruction:
@@ -168,7 +209,7 @@ async def get_llm_response(prompt: str, system_instruction: Optional[str] = None
         raise RuntimeError(f"LLM API error: {str(e)}")
 
 
-async def analyze_and_solve_quiz(question: str, submit_url: str) -> Any:
+async def analyze_and_solve_quiz(question: str, url: str, file_context: str = "") -> Any:
     """
     Use Gemini to understand the question and determine what answer is needed.
     Returns the answer in appropriate format.
@@ -176,7 +217,11 @@ async def analyze_and_solve_quiz(question: str, submit_url: str) -> Any:
     analysis_prompt = f"""
     You are an expert data analyst. Analyze this quiz question carefully:
     
+    Question:
     {question}
+    
+    Context from files (if any):
+    {file_context}
     
     Based on the question, determine:
     1. What type of data source is mentioned (website, API, file, etc.)
@@ -184,17 +229,12 @@ async def analyze_and_solve_quiz(question: str, submit_url: str) -> Any:
     3. What the expected answer format should be (number, string, boolean, JSON, etc.)
     4. Step-by-step approach to solve it
     
-    Provide a structured analysis in JSON format.
+    Provide a structured analysis.
     """
     
     analysis = await get_llm_response(analysis_prompt)
     
-    # For now, return a structured approach
-    # In a real scenario, execute the steps
-    return {
-        "analysis": analysis,
-        "status": "analyzed"
-    }
+    return analysis
 
 
 async def submit_answer(
@@ -260,61 +300,109 @@ async def quiz_endpoint(request: QuizRequest):
 async def solve_quiz_task(url: str, email: str, secret: str, session_key: str):
     """
     Background task to solve quiz.
-    Handles the complete flow: fetch -> analyze -> submit.
+    Handles the complete flow: fetch -> analyze -> submit -> loop.
     """
     session = quiz_sessions.get(session_key)
     if not session:
         return
     
-    try:
-        # Step 1: Fetch page content
-        print(f"[{session_key}] Fetching quiz page...")
-        html_content = await fetch_page_content(url)
-        
-        # Step 2: Extract question
-        print(f"[{session_key}] Extracting question...")
-        question = await extract_question_from_html(html_content)
-        print(f"[{session_key}] Question: {question[:200]}...")
-        
-        # Step 3: Analyze with LLM
-        print(f"[{session_key}] Analyzing with Gemini...")
-        analysis = await analyze_and_solve_quiz(question, url)
-        print(f"[{session_key}] Analysis: {analysis}")
-        
-        # Step 4: Determine answer based on analysis
-        # This is a simplified version - in production, implement specific handlers
-        answer_prompt = f"""
-        Based on this quiz question, provide ONLY the final answer in the format requested.
-        Question:
-        {question}
-        
-        Return ONLY the answer, nothing else.
-        """
-        
-        answer_text = await get_llm_response(answer_prompt)
-        
-        # Try to parse answer based on context
-        answer = parse_answer(answer_text, question)
-        
-        # Step 5: Submit answer
-        print(f"[{session_key}] Submitting answer: {answer}")
-        session.submission_count += 1
-        
-        # Note: In actual implementation, submit to the endpoint
-        session.last_attempt = {
-            "url": url,
-            "answer": answer,
-            "timestamp": datetime.now()
-        }
-        
-        print(f"[{session_key}] Quiz task completed")
-        
-    except Exception as e:
-        print(f"[{session_key}] Error: {str(e)}")
-        session.last_attempt = {
-            "error": str(e),
-            "timestamp": datetime.now()
-        }
+    current_url = url
+    recursion_limit = 10
+    attempts = 0
+    
+    while attempts < recursion_limit and session.can_submit():
+        try:
+            attempts += 1
+            print(f"[{session_key}] Step {attempts}: Processing {current_url}")
+            
+            # Step 1: Fetch page content
+            html_content = await fetch_page_content(current_url)
+            
+            # Step 2: Extract question and look for files
+            question = await extract_question_from_html(html_content)
+            print(f"[{session_key}] Question: {question[:200]}...")
+            
+            # Check for file links (simple heuristic)
+            file_context = ""
+            soup = BeautifulSoup(html_content, "lxml")
+            for link in soup.find_all("a", href=True):
+                href = link["href"]
+                if href.lower().endswith((".pdf", ".csv", ".txt", ".json")):
+                    file_url = urljoin(current_url, href)
+                    print(f"[{session_key}] Found file: {file_url}")
+                    try:
+                        content = await download_file(file_url)
+                        file_context += process_file(content, href.split("/")[-1]) + "\n\n"
+                    except Exception as e:
+                        print(f"[{session_key}] Failed to download/process file {file_url}: {e}")
+
+            # Step 3: Analyze with LLM
+            print(f"[{session_key}] Analyzing with Gemini...")
+            analysis = await analyze_and_solve_quiz(question, current_url, file_context)
+            
+            # Step 4: Determine answer based on analysis
+            answer_prompt = f"""
+            Based on this quiz question and analysis, provide ONLY the final answer in the format requested.
+            
+            Question:
+            {question}
+            
+            File Context:
+            {file_context}
+            
+            Analysis:
+            {analysis}
+            
+            Return ONLY the answer, nothing else. If it's a JSON, return valid JSON.
+            """
+            
+            answer_text = await get_llm_response(answer_prompt)
+            answer = parse_answer(answer_text, question)
+            
+            # Step 5: Submit answer
+            print(f"[{session_key}] Submitting answer: {answer}")
+            response = await submit_answer(answer, current_url, email, secret)
+            
+            session.submission_count += 1
+            session.last_attempt = {
+                "url": current_url,
+                "answer": answer,
+                "timestamp": datetime.now(),
+                "correct": response.correct,
+                "reason": response.reason
+            }
+            
+            if response.correct:
+                print(f"[{session_key}] Answer CORRECT!")
+                if response.url:
+                    print(f"[{session_key}] Proceeding to next URL: {response.url}")
+                    current_url = response.url
+                else:
+                    print(f"[{session_key}] Quiz COMPLETED!")
+                    break
+            else:
+                print(f"[{session_key}] Answer WRONG. Reason: {response.reason}")
+                # In a real scenario, we might want to retry with the reason as feedback
+                # For now, we'll just stop or maybe retry once (logic can be added here)
+                # Let's try to re-analyze with the error reason
+                retry_prompt = f"""
+                The previous answer was wrong.
+                Reason: {response.reason}
+                
+                Please re-analyze and provide the correct answer.
+                """
+                # For simplicity in this loop, we might just break or continue. 
+                # To prevent infinite loops on the same URL, we should probably break if we fail twice on the same URL
+                # But for this implementation, let's just break on failure to avoid spamming
+                break
+                
+        except Exception as e:
+            print(f"[{session_key}] Error: {str(e)}")
+            session.last_attempt = {
+                "error": str(e),
+                "timestamp": datetime.now()
+            }
+            break
 
 
 def parse_answer(answer_text: str, question: str) -> Any:
